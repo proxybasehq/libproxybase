@@ -5,6 +5,7 @@ pub mod network;
 pub mod proxy;
 pub mod shutdown;
 pub mod telemetry;
+pub mod tunnel;
 pub mod updater;
 pub mod wallet;
 
@@ -134,7 +135,7 @@ impl Engine {
 
         // Start telemetry keepalive + heartbeat
         let keepalive_handle = tokio::spawn(async move {
-            crate::telemetry::keepalive::run_keepalive(move || true);
+            crate::telemetry::keepalive::run_keepalive(move || true).await;
         });
 
         if let Some(port) = proxy_port {
