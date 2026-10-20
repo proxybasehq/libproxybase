@@ -20,30 +20,68 @@ pub async fn handle_connection(
 }
 
 /// Minimal SOCKS5 no-auth handshake.
+///
+/// Parses greeting and request incrementally per RFC 1928: messages are
+/// reassembled across TCP segment boundaries and exactly the request bytes
+/// are consumed, so anything the client pipelines behind the request stays
+/// in the stream for the relay loop instead of being swallowed here.
 async fn socks5_handshake(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<()> {
-    let mut buf = [0u8; 256];
-
-    // Read greeting (VER=0x05, NMETHODS, METHODS[])
-    let n = stream.read(&mut buf).await?;
-    if n < 3 || buf[0] != 0x05 {
+    // Greeting: VER, NMETHODS, METHODS[]
+    let mut hdr = [0u8; 2];
+    stream.read_exact(&mut hdr).await?;
+    if hdr[0] != 0x05 {
         anyhow::bail!("Not a SOCKS5 connection");
+    }
+    let nmethods = hdr[1] as usize;
+    if nmethods == 0 {
+        anyhow::bail!("SOCKS5 greeting offered no methods");
+    }
+    let mut methods = vec![0u8; nmethods];
+    stream.read_exact(&mut methods).await?;
+    if !methods.contains(&0x00) {
+        // No mutually supported authentication method (RFC 1928 §3).
+        stream.write_all(&[0x05, 0xFF]).await?;
+        anyhow::bail!("Client does not offer the no-auth method");
     }
 
     // Reply: no authentication required (0x05, 0x00)
     stream.write_all(&[0x05, 0x00]).await?;
 
-    // Read request (VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT)
-    let n = stream.read(&mut buf).await?;
-    if n < 10 {
-        anyhow::bail!("SOCKS5 request too short");
+    // Request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT
+    let mut req = [0u8; 4];
+    stream.read_exact(&mut req).await?;
+    if req[0] != 0x05 {
+        anyhow::bail!("Not a SOCKS5 request");
     }
-    if buf[1] != 0x01 {
+    if req[1] != 0x01 {
         // Not a CONNECT request — reply with error
         stream
             .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await?;
         anyhow::bail!("Only CONNECT is supported");
     }
+
+    // DST.ADDR length depends on ATYP; consume exactly ADDR + PORT so the
+    // relay stream stays aligned. The connect target itself is chosen by the
+    // caller, not from this field.
+    let addr_len = match req[3] {
+        0x01 => 4usize, // IPv4
+        0x04 => 16usize, // IPv6
+        0x03 => {
+            // Domain name: one length byte followed by that many bytes
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            len[0] as usize
+        }
+        _ => {
+            stream
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
+            anyhow::bail!("Unsupported SOCKS5 address type 0x{:02X}", req[3]);
+        }
+    };
+    let mut addr = vec![0u8; addr_len + 2];
+    stream.read_exact(&mut addr).await?;
 
     // Reply: success (0x05, 0x00, 0x00, 0x01, 0.0.0.0, 0)
     stream
@@ -226,6 +264,125 @@ mod tests {
         assert_eq!(resp[1], 0x00); // success
 
         server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_handshake_fragmented_greeting_and_request() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let server_handle = tokio::spawn(async move {
+            let mut stream = server;
+            socks5_handshake(&mut stream).await.is_ok()
+        });
+
+        // Greeting split across two writes: the server's first read must not
+        // treat a partial message as a protocol error.
+        client.write_all(&[0x05]).await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(&[0x01, 0x00]).await.unwrap();
+
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+
+        // CONNECT request also split across two writes (IPv4, 10 bytes).
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 10, 0, 0, 1])
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(&[0x1F, 0x90]).await.unwrap();
+
+        let mut resp = [0u8; 10];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[1], 0x00);
+
+        assert!(server_handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_short_domain_request_accepted() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let server_handle = tokio::spawn(async move {
+            let mut stream = server;
+            socks5_handshake(&mut stream).await
+        });
+
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+
+        // Minimal valid DOMAIN request: VER CMD RSV ATYP LEN 'a' PORT = 8 bytes.
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x03, 0x01, b'a', 0x00, 80])
+            .await
+            .unwrap();
+        let mut resp = [0u8; 10];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[1], 0x00);
+
+        assert!(server_handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_request_with_immediate_payload_relayed_intact() {
+        let (mut cli, cli_srv) = duplex(4096);
+        let (tgt_srv, mut tgt) = duplex(4096);
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+
+        let handle = tokio::spawn(async move {
+            handle_connection(cli_srv, tgt_srv, Some(c), None).await.is_ok()
+        });
+
+        cli.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        cli.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+
+        // IPv6 CONNECT (22 bytes) with the first payload bytes already in
+        // flight behind it — legal for a pipelining client. The handshake must
+        // consume exactly the request so the payload reaches the target once,
+        // uncorrupted.
+        let mut pkt = vec![0x05, 0x01, 0x00, 0x04];
+        pkt.extend_from_slice(&[0x20; 16]); // DST.ADDR
+        pkt.extend_from_slice(&[0x01, 0xBB]); // port 443
+        pkt.extend_from_slice(b"HELLO");
+        cli.write_all(&pkt).await.unwrap();
+
+        let mut resp = [0u8; 10];
+        cli.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[1], 0x00);
+
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), tgt.read(&mut buf))
+            .await
+            .expect("timed out waiting for relayed payload")
+            .unwrap();
+        assert_eq!(&buf[..n], b"HELLO");
+
+        drop(cli);
+        drop(tgt);
+        assert!(handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_greeting_without_no_auth_method_rejected() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let server_handle = tokio::spawn(async move {
+            let mut stream = server;
+            socks5_handshake(&mut stream).await
+        });
+
+        // Client offers only GSSAPI (0x01) — no-auth unavailable.
+        client.write_all(&[0x05, 0x01, 0x01]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0xFF]);
+
+        assert!(server_handle.await.unwrap().is_err());
     }
 
     #[tokio::test]
