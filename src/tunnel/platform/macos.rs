@@ -161,8 +161,23 @@ impl super::PlatformRouteManager for MacOsRouteManager {
         }
 
         // 3. The virtual TUN subnet itself, then the two sub-default halves.
-        let tun_cidr = format!("{}/{}", cfg.tun_ipv4, cfg.tun_prefix);
-        add_net_route(&tun_cidr.parse()?, tun_name).await?;
+        // Canonical network address: route(8) tolerates host bits like
+        // 10.255.0.2/30, but the route table entry should still be
+        // 10.255.0.0/30 (and Linux's `ip` rejects the former outright).
+        let tun_cidr: ipnet::IpNet = format!("{}/{}", cfg.tun_ipv4, cfg.tun_prefix)
+            .parse::<ipnet::IpNet>()?
+            .trunc();
+        // Assigning the interface address already made the kernel install this
+        // connected route. Re-adding it can hit "File exists" and fall through
+        // to `route change`; if that fails too, the existing kernel route is
+        // still exactly what we need, so don't abort the tunnel over it.
+        if let Err(e) = add_net_route(&tun_cidr, tun_name).await {
+            tracing::warn!(
+                cidr = %tun_cidr,
+                error = %e,
+                "could not re-add the TUN subnet route; relying on the connected route"
+            );
+        }
         add_net_route(&"fd00:255::/64".parse()?, tun_name).await?;
         for net in ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"] {
             add_net_route(&net.parse()?, tun_name).await?;
@@ -239,7 +254,7 @@ impl super::PlatformRouteManager for MacOsRouteManager {
             let Ok(net) = cidr.parse::<ipnet::IpNet>() else {
                 continue;
             };
-            let cidr = net.to_string();
+            let cidr = net.trunc().to_string();
             let mut args = vec!["-n", "delete"];
             if net.addr().is_ipv6() {
                 args.push("-inet6");

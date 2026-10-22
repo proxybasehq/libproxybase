@@ -142,7 +142,13 @@ impl super::PlatformRouteManager for LinuxRouteManager {
 
         // 3. TUN subnet and sub-default halves. These must succeed: a
         //    silently missing /1 route leaves traffic untunneled.
-        add_net_checked(&format!("{}/{}", cfg.tun_ipv4, cfg.tun_prefix), tun_name).await?;
+        //    `ip` rejects prefixes with host bits set ("Invalid prefix for
+        //    given prefix length"), so use the canonical network address
+        //    (10.255.0.2/30 -> 10.255.0.0/30).
+        let tun_net: ipnet::IpNet = format!("{}/{}", cfg.tun_ipv4, cfg.tun_prefix)
+            .parse()
+            .map_err(|e| anyhow!("invalid TUN subnet: {e}"))?;
+        add_net_checked(&tun_net.trunc().to_string(), tun_name).await?;
         add_net_checked("fd00:255::/64", tun_name).await?;
         for net in ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"] {
             add_net_checked(net, tun_name).await?;
@@ -261,7 +267,7 @@ impl super::PlatformRouteManager for LinuxRouteManager {
             let Ok(net) = cidr.parse::<ipnet::IpNet>() else {
                 continue;
             };
-            let cidr = net.to_string();
+            let cidr = net.trunc().to_string();
             let args: Vec<&str> = if net.addr().is_ipv6() {
                 vec!["-6", "route", "del", &cidr]
             } else {

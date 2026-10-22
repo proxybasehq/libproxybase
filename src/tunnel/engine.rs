@@ -438,7 +438,13 @@ impl SystemTunnelEngine {
             config.upstream_relay_ip.to_string(),
             Vec::new(),
         );
-        journal.tun_ipv4_cidr = Some(format!("{}/{}", config.tun_ipv4, config.tun_prefix));
+        // Store the canonical network, not the interface address: 10.255.0.2/30
+        // must be recorded (and later deleted) as 10.255.0.0/30. Linux's `ip`
+        // rejects prefixes with host bits set.
+        let tun_net: ipnet::IpNet = format!("{}/{}", config.tun_ipv4, config.tun_prefix)
+            .parse()
+            .expect("validated TUN subnet");
+        journal.tun_ipv4_cidr = Some(tun_net.trunc().to_string());
         #[cfg(target_os = "linux")]
         {
             if manager.platform_name() == "linux" {

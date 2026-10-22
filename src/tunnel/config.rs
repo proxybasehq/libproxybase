@@ -241,10 +241,12 @@ impl TunnelConfig {
     pub fn bypass_nets(&self) -> Result<Vec<ipnet::IpNet>, String> {
         let mut nets = Self::mandatory_bypass_nets();
         for cidr in &self.custom_bypass_cidrs {
-            nets.push(
-                cidr.parse()
-                    .map_err(|e| format!("invalid bypass CIDR {cidr:?}: {e}"))?,
-            );
+            let net: ipnet::IpNet = cidr
+                .parse()
+                .map_err(|e| format!("invalid bypass CIDR {cidr:?}: {e}"))?;
+            // Accept host bits in user input but route the canonical network
+            // (Linux `ip` rejects e.g. 192.168.50.5/24 outright).
+            nets.push(net.trunc());
         }
         nets.sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
         nets.dedup();
@@ -366,6 +368,18 @@ mod tests {
             let back: TunnelState = serde_json::from_value(json).unwrap();
             assert_eq!(back, state);
         }
+    }
+
+    #[test]
+    fn bypass_cidrs_are_canonicalized() {
+        // Users may type host bits (192.168.50.5/24); Linux's `ip` rejects
+        // such prefixes, so bypass_nets() must hand out the network address.
+        let mut cfg = TunnelConfig::default();
+        cfg.proxy_id = "session".into();
+        cfg.custom_bypass_cidrs = vec!["192.168.50.5/24".into()];
+        let nets = cfg.bypass_nets().unwrap();
+        assert!(nets.contains(&"192.168.50.0/24".parse().unwrap()));
+        assert!(!nets.contains(&"192.168.50.5/24".parse().unwrap()));
     }
 
     #[test]
