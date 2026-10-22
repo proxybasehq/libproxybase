@@ -1,6 +1,6 @@
 [package]
 name = "libproxybase"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "Core engine library for ProxyBase networking, market connectivity, proxying, and telemetry"
 license = "MIT"

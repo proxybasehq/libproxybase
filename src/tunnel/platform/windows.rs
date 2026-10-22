@@ -8,42 +8,43 @@
 //! on every physical interface; the kernel removes those filters automatically
 //! if this process exits or crashes.
 
-use super::PlatformRouteManager;
+use super::{unspecified_like, PlatformRouteManager, RouteSpec};
 use crate::tunnel::config::TunnelConfig;
 use crate::tunnel::journal::RollbackJournal;
 use crate::tunnel::socket_bypass::PhysicalInterfaceInfo;
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, HANDLE, WIN32_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToNameW,
-    ConvertInterfaceNameToLuidW, CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable,
-    GetAdaptersAddresses, GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry,
-    InitializeIpInterfaceEntry, SetInterfaceDnsSettings, SetIpForwardEntry2, DNS_INTERFACE_SETTINGS,
-    DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, GAA_FLAG_INCLUDE_ALL_INTERFACES,
-    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, MIB_IPFORWARD_ROW2,
-    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToAlias, ConvertInterfaceLuidToGuid,
+    ConvertInterfaceLuidToIndex, ConvertInterfaceLuidToNameW, ConvertInterfaceNameToLuidW,
+    CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetAdaptersAddresses,
+    GetBestRoute2, GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry,
+    InitializeIpInterfaceEntry, SetInterfaceDnsSettings, SetIpForwardEntry2,
+    DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER,
+    GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
+    IP_ADAPTER_ADDRESSES_LH, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmSubLayerAdd0, FWPM_ACTION0,
-    FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_SESSION0,
-    FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_CONDITION_VALUE0, FWP_EMPTY,
-    FWP_MATCH_EQUAL, FWP_MATCH_NOT_EQUAL, FWP_UINT16, FWP_UINT64, FWP_UINT8, FWP_VALUE0,
     FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_PORT,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0,
+    FWP_ACTION_BLOCK, FWP_CONDITION_VALUE0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_MATCH_NOT_EQUAL,
+    FWP_UINT16, FWP_UINT64, FWP_UINT8, FWP_VALUE0,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, AF_UNSPEC, IPPROTO_TCP, IPPROTO_UDP, SOCKADDR, SOCKADDR_IN, SOCKADDR_INET,
+    NlroManual, AF_INET, AF_INET6, AF_UNSPEC, IPPROTO_TCP, IPPROTO_UDP, MIB_IPPROTO_NETMGMT,
+    SOCKADDR, SOCKADDR_IN, SOCKADDR_INET,
 };
-use windows_sys::Win32::Networking::WinSock::MIB_IPPROTO_NETMGMT;
 
 const RPC_C_AUTHN_WINNT: u32 = 10;
-const LOOPBACK_INTERFACE_INDEX: u32 = 1;
 
 // A stable private GUID for our WFP sublayer: {9a6b1d20-4c51-4b7e-9d3d-5042c0de0001}
 const PROXYBASE_SUBLAYER_GUID: windows_sys::core::GUID =
@@ -85,7 +86,10 @@ impl Drop for WfpSession {
 #[async_trait]
 impl PlatformRouteManager for WindowsRouteManager {
     async fn detect_physical_route(&self) -> anyhow::Result<PhysicalInterfaceInfo> {
-        detect_default_route()
+        // When the tunnel is already up, its sub-default routes can win the
+        // route lookup; never mistake our own TUN for the physical uplink.
+        let own_tun = self.tun_luid.lock().ok().and_then(|guard| *guard);
+        detect_default_route(own_tun)
     }
 
     async fn apply_routes(
@@ -97,27 +101,66 @@ impl PlatformRouteManager for WindowsRouteManager {
         let phys_luid = luid_from_name(&phys.name)?;
         let tun_luid = luid_from_name(tun_name)?;
 
-        // 1. Relay host route pinned to the physical interface. Loopback
-        //    relays stay on the machine and are never routed.
-        if !cfg.upstream_relay_ip.is_loopback() {
-            add_or_replace_route(
-                &phys_luid,
-                cfg.upstream_relay_ip,
-                if cfg.upstream_relay_ip.is_ipv4() { 32 } else { 128 },
-                Some(phys.gateway_ip),
-                1,
-            )?;
+        // Wintun registers the adapter asynchronously. Adding routes to an
+        // interface the IP Helper provider has not published yet fails with
+        // ERROR_INVALID_PARAMETER (87) or ERROR_NOT_FOUND (1168); give it a
+        // bounded moment to settle instead of failing the whole tunnel.
+        if !wait_for_interface(&tun_luid, Duration::from_secs(3)).await {
+            tracing::warn!(
+                interface = %tun_name,
+                "TUN interface did not report as connected before route setup"
+            );
         }
 
-        // 2. Bypass routes. Loopback, link-local, multicast and broadcast are
-        //    deliberately not re-added on Windows: the OS already has
-        //    more-specific routes for them, and re-pointing 127/8 at the NIC
-        //    would break localhost.
+        // 1. Relay host route pinned off the tunnel. Ask Windows which route
+        //    it would actually use for the relay instead of assuming the
+        //    default gateway: this keeps the interface, address family and
+        //    next hop consistent on multi-homed hosts, VPNs, and IPv6 relays.
+        //    Loopback relays stay on the machine and are never routed.
+        if !cfg.upstream_relay_ip.is_loopback() {
+            let relay = cfg.upstream_relay_ip;
+            let prefix_len = if relay.is_ipv4() { 32 } else { 128 };
+            let best = best_route_for(relay)
+                .filter(|route| luid_value(&route.luid) != luid_value(&tun_luid));
+            let (relay_luid, relay_next_hop) = match best {
+                Some(route) => (route.luid, route.next_hop),
+                None => {
+                    // Fall back to the detected default route, but only if the
+                    // address families agree (an IPv4 gateway can never route
+                    // an IPv6 relay; Windows answers that with error 87).
+                    let next = if phys.gateway_ip.is_ipv4() == relay.is_ipv4() {
+                        phys.gateway_ip
+                    } else {
+                        unspecified_like(relay)
+                    };
+                    (phys_luid, next)
+                }
+            };
+            add_or_replace_route(
+                &relay_luid,
+                relay,
+                prefix_len,
+                if relay_next_hop.is_unspecified() {
+                    None
+                } else {
+                    Some(relay_next_hop)
+                },
+                1,
+            )
+            .await
+            .context("failed to pin the upstream relay route off the tunnel")?;
+            tracing::info!(
+                relay = %relay,
+                interface = %interface_label(&relay_luid),
+                next_hop = %relay_next_hop,
+                "pinned upstream relay route"
+            );
+        }
+
+        // 2. Bypass routes. Loopback, broadcast and multicast are deliberately
+        //    not re-added on Windows: the OS already has more-specific routes
+        //    for them, and re-pointing 127/8 at the NIC would break localhost.
         for net in cfg.bypass_nets().map_err(anyhow::Error::msg)? {
-            // Add every configured bypass except loopback, broadcast and
-            // multicast. Unlike the Unix path, Windows has no per-interface
-            // local table for 127/8, so writing such a route would break
-            // localhost.
             let skip = match net.addr() {
                 IpAddr::V4(v4) => v4.is_loopback() || v4.is_broadcast() || v4.is_multicast(),
                 IpAddr::V6(v6) => v6.is_loopback() || v6.is_multicast(),
@@ -125,19 +168,23 @@ impl PlatformRouteManager for WindowsRouteManager {
             if skip {
                 continue;
             }
+            // Link-local destinations are reachable only on the local link;
+            // sending them through the gateway would blackhole them.
             let next_hop = match net.addr() {
+                IpAddr::V4(v4) if v4.is_link_local() => None,
                 IpAddr::V4(_) => Some(phys.gateway_ip),
                 IpAddr::V6(_) => None,
             };
             if let Err(e) =
-                add_or_replace_route(&phys_luid, net.addr(), net.prefix_len(), next_hop, 1)
+                add_or_replace_route(&phys_luid, net.addr(), net.prefix_len(), next_hop, 1).await
             {
                 tracing::warn!(cidr = %net, error = %e, "could not install bypass route");
             }
         }
 
         // 3. TUN subnet, ULA, then the sub-default halves (never the real
-        //    default route).
+        //    default route). Windows creates the on-link subnet route when the
+        //    address is assigned; adding it again is an idempotent no-op.
         let tun_cidr: ipnet::IpNet = format!("{}/{}", cfg.tun_ipv4, cfg.tun_prefix).parse()?;
         add_or_replace_route(
             &tun_luid,
@@ -145,24 +192,28 @@ impl PlatformRouteManager for WindowsRouteManager {
             tun_cidr.prefix_len(),
             None,
             1,
-        )?;
-        if let Err(e) = add_or_replace_route(
-            &tun_luid,
-            "fd00:255::".parse().unwrap(),
-            64,
-            None,
-            1,
-        ) {
+        )
+        .await
+        .context("failed to install the TUN subnet route")?;
+        if let Err(e) =
+            add_or_replace_route(&tun_luid, "fd00:255::".parse().unwrap(), 64, None, 1).await
+        {
             tracing::warn!(error = %e, "could not install IPv6 ULA route; continuing");
         }
         for cidr in ["0.0.0.0/1", "128.0.0.0/1"] {
             let net: ipnet::IpNet = cidr.parse().unwrap();
-            add_or_replace_route(&tun_luid, net.addr(), net.prefix_len(), None, 1)?;
+            add_or_replace_route(&tun_luid, net.addr(), net.prefix_len(), None, 1).await?;
         }
         for cidr in ["::/1", "8000::/1"] {
             let net: ipnet::IpNet = cidr.parse().unwrap();
-            if let Err(e) = add_or_replace_route(&tun_luid, net.addr(), net.prefix_len(), None, 1) {
-                tracing::warn!(cidr = %cidr, error = %e, "could not install IPv6 sub-default route; continuing with IPv4 tunnel");
+            if let Err(e) =
+                add_or_replace_route(&tun_luid, net.addr(), net.prefix_len(), None, 1).await
+            {
+                tracing::warn!(
+                    cidr = %cidr,
+                    error = %e,
+                    "could not install IPv6 sub-default route; IPv6 traffic may bypass the tunnel"
+                );
             }
         }
 
@@ -203,17 +254,17 @@ impl PlatformRouteManager for WindowsRouteManager {
         if let Ok(mut guard) = self.wfp.lock() {
             *guard = None;
         }
-
-        let phys_luid = luid_from_name(&journal.physical_interface).ok();
-        if let Some(luid) = phys_luid {
-            if let Ok(relay) = journal.upstream_relay_ip.parse::<IpAddr>() {
-                let _ = delete_route(
-                    &luid,
-                    relay,
-                    if relay.is_ipv4() { 32 } else { 128 },
-                );
-            }
+        if let Ok(mut guard) = self.tun_luid.lock() {
+            *guard = None;
         }
+
+        // The relay pin may live on a different interface than the one
+        // detected at startup (multi-homed hosts, VPNs), so delete it by
+        // destination across every interface.
+        if let Ok(relay) = journal.upstream_relay_ip.parse::<IpAddr>() {
+            delete_route_everywhere(relay, if relay.is_ipv4() { 32 } else { 128 });
+        }
+        let phys_luid = luid_from_name(&journal.physical_interface).ok();
 
         for cidr in &journal.routes_added {
             let Ok(net) = cidr.parse::<ipnet::IpNet>() else {
@@ -235,11 +286,7 @@ impl PlatformRouteManager for WindowsRouteManager {
         Ok(())
     }
 
-    async fn refresh_dns_guard(
-        &self,
-        tun_name: &str,
-        dns_ip: Ipv4Addr,
-    ) -> anyhow::Result<()> {
+    async fn refresh_dns_guard(&self, tun_name: &str, dns_ip: Ipv4Addr) -> anyhow::Result<()> {
         self.apply_dns(tun_name, dns_ip).await?;
         self.rebuild_wfp()
     }
@@ -262,23 +309,32 @@ impl PlatformRouteManager for WindowsRouteManager {
         if relay.is_loopback() {
             return Ok(());
         }
+        let prefix_len = if relay.is_ipv4() { 32 } else { 128 };
+        let next_hop = if phys.gateway_ip.is_ipv4() == relay.is_ipv4() {
+            let next = phys.gateway_ip;
+            if next.is_unspecified() {
+                None
+            } else {
+                Some(next)
+            }
+        } else {
+            // The detected interface carries a gateway of the other family.
+            // Drop the stale pin first so GetBestRoute2 sees the new uplink,
+            // then ask Windows for a valid same-family next hop.
+            delete_route_everywhere(relay, prefix_len);
+            best_route_for(relay)
+                .map(|route| route.next_hop)
+                .filter(|ip| !ip.is_unspecified())
+        };
         let luid = luid_from_name(&phys.name)?;
-        add_or_replace_route(
-            &luid,
-            relay,
-            if relay.is_ipv4() { 32 } else { 128 },
-            Some(phys.gateway_ip),
-            1,
-        )
+        add_or_replace_route(&luid, relay, prefix_len, next_hop, 1).await
     }
 
-    async fn remove_relay_route(&self, relay: IpAddr, phys: &PhysicalInterfaceInfo) {
+    async fn remove_relay_route(&self, relay: IpAddr, _phys: &PhysicalInterfaceInfo) {
         if relay.is_loopback() {
             return;
         }
-        if let Ok(luid) = luid_from_name(&phys.name) {
-            let _ = delete_route(&luid, relay, if relay.is_ipv4() { 32 } else { 128 });
-        }
+        delete_route_everywhere(relay, if relay.is_ipv4() { 32 } else { 128 });
     }
 
     fn platform_name(&self) -> &'static str {
@@ -468,7 +524,7 @@ impl WfpEngine {
 // Route helpers
 // ---------------------------------------------------------------------------
 
-fn detect_default_route() -> anyhow::Result<PhysicalInterfaceInfo> {
+fn detect_default_route(own_tun: Option<u64>) -> anyhow::Result<PhysicalInterfaceInfo> {
     let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
     let status = unsafe { GetIpForwardTable2(AF_INET, &mut table) };
     if status != 0 {
@@ -477,13 +533,28 @@ fn detect_default_route() -> anyhow::Result<PhysicalInterfaceInfo> {
     let rows = unsafe {
         std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
     };
-    let mut best: Option<(u32, NET_LUID_LH, Ipv4Addr, u32)> = None;
+    let mut best_connected: Option<(u32, NET_LUID_LH, Ipv4Addr, u32)> = None;
+    let mut best_any: Option<(u32, NET_LUID_LH, Ipv4Addr, u32)> = None;
     for row in rows {
         if row.DestinationPrefix.PrefixLength != 0 {
             continue;
         }
         let prefix_ip = unsafe { sockaddr_ip(&row.DestinationPrefix.Prefix) };
         if prefix_ip != Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
+            continue;
+        }
+        // Never select our own tunnel as the "physical" uplink. Its 0/1 and
+        // 128/1 routes contain every IPv4 destination; picking it would pin
+        // the relay route back into the tunnel.
+        if own_tun == Some(luid_value(&row.InterfaceLuid)) {
+            continue;
+        }
+        let Ok(name) = name_from_luid(&row.InterfaceLuid) else {
+            continue;
+        };
+        if is_own_tun_name(&name)
+            || interface_alias(&row.InterfaceLuid).is_some_and(|a| is_own_tun_name(&a))
+        {
             continue;
         }
         let next_hop = unsafe { sockaddr_ip(&row.NextHop) }
@@ -495,28 +566,32 @@ fn detect_default_route() -> anyhow::Result<PhysicalInterfaceInfo> {
         if next_hop == Ipv4Addr::UNSPECIFIED {
             continue;
         }
-        let mut if_row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
-        unsafe { InitializeIpInterfaceEntry(&mut if_row) };
-        if_row.Family = AF_INET;
-        if_row.InterfaceLuid = row.InterfaceLuid;
-        let if_metric = if unsafe { GetIpInterfaceEntry(&mut if_row) } == 0 {
-            if_row.Metric
-        } else {
-            0
-        };
+        let if_row = interface_row(&row.InterfaceLuid);
+        let if_metric = if_row.map(|if_row| if_row.Metric).unwrap_or(0);
         let effective_metric = row.Metric.saturating_add(if_metric);
-        let candidate = (effective_metric, row.InterfaceLuid, next_hop, row.InterfaceIndex);
-        if best
-            .as_ref()
-            .map(|(metric, _, _, _)| effective_metric < *metric)
-            .unwrap_or(true)
-        {
-            best = Some(candidate);
+        let candidate = (
+            effective_metric,
+            row.InterfaceLuid,
+            next_hop,
+            row.InterfaceIndex,
+        );
+        let is_better = |best: &Option<(u32, NET_LUID_LH, Ipv4Addr, u32)>| {
+            best.as_ref()
+                .map(|(metric, _, _, _)| effective_metric < *metric)
+                .unwrap_or(true)
+        };
+        if is_better(&best_any) {
+            best_any = Some(candidate);
+        }
+        let connected = if_row.map(|if_row| if_row.Connected).unwrap_or(true);
+        if connected && is_better(&best_connected) {
+            best_connected = Some(candidate);
         }
     }
     unsafe { FreeMibTable(table as *const _) };
-    let (_, luid, gateway, index) =
-        best.ok_or_else(|| anyhow!("no IPv4 default route found"))?;
+    let (_, luid, gateway, index) = best_connected
+        .or(best_any)
+        .ok_or_else(|| anyhow!("no IPv4 default route found"))?;
     let name = name_from_luid(&luid)?;
     Ok(PhysicalInterfaceInfo {
         name,
@@ -525,91 +600,338 @@ fn detect_default_route() -> anyhow::Result<PhysicalInterfaceInfo> {
     })
 }
 
-fn add_or_replace_route(
+/// Ask Windows which route it would use for `destination`.
+///
+/// Copying the interface and next hop from the OS's own best-route lookup
+/// keeps the pin valid on multi-homed machines, VPNs and for IPv6 relays,
+/// where assuming the IPv4 default gateway would produce a mismatched row
+/// that `CreateIpForwardEntry2` rejects with `ERROR_INVALID_PARAMETER` (87).
+struct BestRoute {
+    luid: NET_LUID_LH,
+    next_hop: IpAddr,
+    #[allow(dead_code)]
+    index: u32,
+}
+
+fn best_route_for(destination: IpAddr) -> Option<BestRoute> {
+    let dest = make_sockaddr(destination);
+    let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+    let mut source: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        GetBestRoute2(
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &dest,
+            0,
+            &mut row,
+            &mut source,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let next_hop = unsafe { sockaddr_ip(&row.NextHop) }
+        .filter(|ip| ip.is_ipv4() == destination.is_ipv4())
+        .unwrap_or_else(|| unspecified_like(destination));
+    Some(BestRoute {
+        luid: row.InterfaceLuid,
+        next_hop,
+        index: row.InterfaceIndex,
+    })
+}
+
+fn build_route_row(spec: &RouteSpec, luid: &NET_LUID_LH) -> MIB_IPFORWARD_ROW2 {
+    let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+    unsafe { InitializeIpForwardEntry(&mut row) };
+    row.InterfaceLuid = *luid;
+    if let Some(index) = luid_index(luid) {
+        row.InterfaceIndex = index;
+    }
+    row.DestinationPrefix.Prefix = make_sockaddr(spec.destination);
+    row.DestinationPrefix.PrefixLength = spec.prefix_len;
+    row.NextHop = make_sockaddr(spec.next_hop);
+    // InitializeIpForwardEntry intentionally leaves SitePrefixLength, Metric
+    // and Protocol at illegal sentinel values and sets the boolean flags to
+    // TRUE. Fill every field explicitly so no undocumented default can make
+    // CreateIpForwardEntry2 reject the row with error 87.
+    row.SitePrefixLength = 0;
+    row.ValidLifetime = u32::MAX;
+    row.PreferredLifetime = u32::MAX;
+    row.Metric = spec.metric;
+    row.Protocol = MIB_IPPROTO_NETMGMT;
+    row.Loopback = false;
+    row.AutoconfigureAddress = false;
+    row.Publish = false;
+    row.Immortal = true;
+    row.Age = 0;
+    row.Origin = NlroManual;
+    row
+}
+
+async fn add_or_replace_route(
     luid: &NET_LUID_LH,
     destination: IpAddr,
     prefix_len: u8,
     next_hop: Option<IpAddr>,
     metric: u32,
 ) -> anyhow::Result<()> {
-    // Windows rejects routes with non-zero host bits outside prefix_len
-    // with ERROR_INVALID_PARAMETER (87). Truncate to network address.
-    let clean_dest = ipnet::IpNet::new(destination, prefix_len)
-        .map(|net| net.trunc().addr())
-        .unwrap_or(destination);
+    let spec = RouteSpec::new(destination, prefix_len, next_hop, metric)?;
+    let row = build_route_row(&spec, luid);
+    let mut replaced = false;
 
-    let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
-    unsafe { InitializeIpForwardEntry(&mut row) };
-    row.InterfaceLuid = *luid;
-    row.DestinationPrefix.PrefixLength = prefix_len;
-    row.DestinationPrefix.Prefix = make_sockaddr(clean_dest);
-    row.NextHop = make_sockaddr(next_hop.unwrap_or_else(|| unspecified_like(clean_dest)));
-    // InitializeIpForwardEntry sets SitePrefixLength to 255 (illegal).
-    // If SitePrefixLength > DestinationPrefix.PrefixLength, CreateIpForwardEntry2
-    // fails with ERROR_INVALID_PARAMETER (87). It must be explicitly set to 0.
-    row.SitePrefixLength = 0;
-    row.Metric = metric;
-    row.Protocol = MIB_IPPROTO_NETMGMT;
-    row.Immortal = true;
-    row.Loopback = false;
-
-    let status = unsafe { CreateIpForwardEntry2(&row) };
-    if status == ERROR_OBJECT_ALREADY_EXISTS {
-        let status = unsafe { SetIpForwardEntry2(&row) };
-        if status != 0 && status != ERROR_NOT_FOUND {
-            return Err(anyhow!("SetIpForwardEntry2 failed: {status}"));
+    for attempt in 0..6u32 {
+        let status = unsafe { CreateIpForwardEntry2(&row) };
+        if status == 0 {
+            tracing::debug!(
+                route = %route_label(&spec),
+                interface = %interface_label(luid),
+                "route installed"
+            );
+            return Ok(());
         }
-        return Ok(());
+        if status == ERROR_OBJECT_ALREADY_EXISTS {
+            // Already exactly the route we want (e.g. the on-link subnet
+            // route Windows created together with the interface address).
+            if !matching_routes(luid, &spec, true).is_empty() {
+                return Ok(());
+            }
+            // A conflicting route owns this prefix on this interface.
+            // SetIpForwardEntry2 only matches when NextHop is identical, so
+            // try it and then fall back to delete-and-recreate.
+            let set_status = unsafe { SetIpForwardEntry2(&row) };
+            if set_status == 0 {
+                return Ok(());
+            }
+            if replaced {
+                return Err(route_error("CreateIpForwardEntry2", &spec, luid, status));
+            }
+            let removed = delete_matching_routes(luid, &spec);
+            tracing::debug!(
+                route = %route_label(&spec),
+                interface = %interface_label(luid),
+                removed,
+                set_error = set_status,
+                "replacing conflicting route"
+            );
+            replaced = true;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
+        if (status == 87 || status == ERROR_NOT_FOUND) && attempt < 5 {
+            // A freshly created Wintun adapter can be visible to the adapter
+            // API before the IP Helper route provider has published it.
+            tokio::time::sleep(Duration::from_millis(100 * (u64::from(attempt) + 1))).await;
+            continue;
+        }
+        return Err(route_error("CreateIpForwardEntry2", &spec, luid, status));
     }
-    if status != 0 {
-        return Err(anyhow!("CreateIpForwardEntry2 failed: {status}"));
-    }
-    Ok(())
+
+    Err(anyhow!(
+        "route installation did not converge for {} on {}",
+        route_label(&spec),
+        interface_label(luid)
+    ))
 }
 
 fn delete_route(luid: &NET_LUID_LH, destination: IpAddr, prefix_len: u8) -> WIN32_ERROR {
-    let clean_dest = ipnet::IpNet::new(destination, prefix_len)
-        .map(|net| net.trunc().addr())
-        .unwrap_or(destination);
-    let family = match destination {
-        IpAddr::V4(_) => AF_INET,
-        IpAddr::V6(_) => AF_INET6,
+    let Ok(spec) = RouteSpec::new(destination, prefix_len, None, 0) else {
+        return 87;
     };
-    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
-    let status = unsafe { GetIpForwardTable2(family, &mut table) };
-    if status == 0 && !table.is_null() {
-        let rows = unsafe {
-            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
-        };
+    // Only remove static routes we installed. Connected and DHCP-owned routes
+    // existed before the tunnel and must survive disconnect (otherwise, for
+    // example, deleting a /8 bypass route could take the LAN with it).
+    let rows = routes_matching(&spec, Some(luid_value(luid)), false, true);
+    if !rows.is_empty() {
         let mut last_error = 0;
-        let mut deleted = false;
-        for row in rows {
-            if unsafe { row.InterfaceLuid.Value == luid.Value }
-                && row.DestinationPrefix.PrefixLength == prefix_len
-                && unsafe { sockaddr_ip(&row.DestinationPrefix.Prefix) } == Some(clean_dest)
-            {
-                let err = unsafe { DeleteIpForwardEntry2(row) };
-                if err != 0 {
-                    last_error = err;
-                } else {
-                    deleted = true;
-                }
+        for row in &rows {
+            let err = unsafe { DeleteIpForwardEntry2(row) };
+            if err != 0 {
+                last_error = err;
             }
         }
-        unsafe { FreeMibTable(table as *const _) };
-        if deleted || last_error == 0 {
+        if last_error == 0 {
             return 0;
         }
     }
 
-    let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
-    unsafe { InitializeIpForwardEntry(&mut row) };
-    row.InterfaceLuid = *luid;
-    row.DestinationPrefix.PrefixLength = prefix_len;
-    row.DestinationPrefix.Prefix = make_sockaddr(clean_dest);
-    row.NextHop = make_sockaddr(unspecified_like(clean_dest));
-    row.SitePrefixLength = 0;
+    let row = build_route_row(&spec, luid);
     unsafe { DeleteIpForwardEntry2(&row) }
+}
+
+/// Delete every static route to `destination/prefix_len`, regardless of
+/// interface.
+///
+/// Used for the relay pin, whose interface can change across networks or be
+/// different from the detected default route on multi-homed hosts.
+fn delete_route_everywhere(destination: IpAddr, prefix_len: u8) -> usize {
+    let Ok(spec) = RouteSpec::new(destination, prefix_len, None, 0) else {
+        return 0;
+    };
+    let rows = routes_matching(&spec, None, false, true);
+    let mut removed = 0;
+    for row in &rows {
+        if unsafe { DeleteIpForwardEntry2(row) } == 0 {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn matching_routes(
+    luid: &NET_LUID_LH,
+    spec: &RouteSpec,
+    same_next_hop: bool,
+) -> Vec<MIB_IPFORWARD_ROW2> {
+    routes_matching(spec, Some(luid_value(luid)), same_next_hop, false)
+}
+
+fn delete_matching_routes(luid: &NET_LUID_LH, spec: &RouteSpec) -> usize {
+    let rows = matching_routes(luid, spec, false);
+    let mut removed = 0;
+    for row in &rows {
+        if unsafe { DeleteIpForwardEntry2(row) } == 0 {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn routes_matching(
+    spec: &RouteSpec,
+    luid: Option<u64>,
+    same_next_hop: bool,
+    only_netmgmt: bool,
+) -> Vec<MIB_IPFORWARD_ROW2> {
+    let family = if spec.destination.is_ipv4() {
+        AF_INET
+    } else {
+        AF_INET6
+    };
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIpForwardTable2(family, &mut table) } != 0 || table.is_null() {
+        return Vec::new();
+    }
+    let rows = unsafe {
+        std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        if let Some(luid) = luid {
+            if luid_value(&row.InterfaceLuid) != luid {
+                continue;
+            }
+        }
+        if row.DestinationPrefix.PrefixLength != spec.prefix_len {
+            continue;
+        }
+        if only_netmgmt && row.Protocol != MIB_IPPROTO_NETMGMT {
+            continue;
+        }
+        if unsafe { sockaddr_ip(&row.DestinationPrefix.Prefix) } != Some(spec.destination) {
+            continue;
+        }
+        if same_next_hop && unsafe { sockaddr_ip(&row.NextHop) } != Some(spec.next_hop) {
+            continue;
+        }
+        out.push(*row);
+    }
+    unsafe { FreeMibTable(table as *const _) };
+    out
+}
+
+fn luid_value(luid: &NET_LUID_LH) -> u64 {
+    unsafe { luid.Value }
+}
+
+fn luid_index(luid: &NET_LUID_LH) -> Option<u32> {
+    let mut index = 0u32;
+    if unsafe { ConvertInterfaceLuidToIndex(luid, &mut index) } == 0 {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn interface_row(luid: &NET_LUID_LH) -> Option<MIB_IPINTERFACE_ROW> {
+    let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = AF_INET;
+    row.InterfaceLuid = *luid;
+    if unsafe { GetIpInterfaceEntry(&mut row) } == 0 {
+        Some(row)
+    } else {
+        None
+    }
+}
+
+async fn wait_for_interface(luid: &NET_LUID_LH, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // `GetIpInterfaceEntry` succeeding means the IP Helper route provider
+        // has published the interface; that is what CreateIpForwardEntry2
+        // needs. Media state can lag behind and is not required for routes.
+        if luid_index(luid).is_some() && interface_row(luid).is_some() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn is_own_tun_name(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("proxybase")
+}
+
+fn interface_alias(luid: &NET_LUID_LH) -> Option<String> {
+    let mut buf = vec![0u16; 257];
+    let status = unsafe { ConvertInterfaceLuidToAlias(luid, buf.as_mut_ptr(), buf.len()) };
+    if status != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
+fn interface_label(luid: &NET_LUID_LH) -> String {
+    match interface_alias(luid) {
+        Some(alias) => format!("{alias} [LUID {:#x}]", luid_value(luid)),
+        None => format!("LUID {:#x}", luid_value(luid)),
+    }
+}
+
+fn route_label(spec: &RouteSpec) -> String {
+    format!(
+        "{}/{} via {}",
+        spec.destination, spec.prefix_len, spec.next_hop
+    )
+}
+
+fn route_error(
+    op: &str,
+    spec: &RouteSpec,
+    luid: &NET_LUID_LH,
+    status: WIN32_ERROR,
+) -> anyhow::Error {
+    anyhow!(
+        "{op} failed for {} on {}: {} [Windows error {status}]",
+        route_label(spec),
+        interface_label(luid),
+        route_status_text(status)
+    )
+}
+
+fn route_status_text(status: WIN32_ERROR) -> &'static str {
+    match status {
+        5 => "access denied — the tunnel service must run with administrator rights",
+        50 => "the interface does not support routes",
+        87 => "invalid route parameters (destination prefix, next hop, or interface rejected)",
+        1168 => "the interface was not found",
+        5010 => "a matching route already exists",
+        _ => "unexpected Windows routing error",
+    }
 }
 
 fn make_sockaddr(ip: IpAddr) -> SOCKADDR_INET {
@@ -625,13 +947,6 @@ fn make_sockaddr(ip: IpAddr) -> SOCKADDR_INET {
         }
     }
     sa
-}
-
-fn unspecified_like(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-    }
 }
 
 unsafe fn sockaddr_ip(sa: &SOCKADDR_INET) -> Option<IpAddr> {
@@ -670,8 +985,7 @@ fn luid_from_name(name: &str) -> anyhow::Result<NET_LUID_LH> {
 
 fn name_from_luid(luid: &NET_LUID_LH) -> anyhow::Result<String> {
     let mut buf = vec![0u16; 256];
-    let status =
-        unsafe { ConvertInterfaceLuidToNameW(luid, buf.as_mut_ptr(), buf.len()) };
+    let status = unsafe { ConvertInterfaceLuidToNameW(luid, buf.as_mut_ptr(), buf.len()) };
     if status != 0 {
         return Err(anyhow!("ConvertInterfaceLuidToNameW failed: {status}"));
     }
@@ -684,12 +998,16 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 fn original_dns_servers(if_index: u32) -> anyhow::Result<Vec<String>> {
-    let flags = GAA_FLAG_INCLUDE_ALL_INTERFACES
-        | GAA_FLAG_SKIP_ANYCAST
-        | GAA_FLAG_SKIP_MULTICAST;
+    let flags = GAA_FLAG_INCLUDE_ALL_INTERFACES | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
     let mut size: u32 = 0;
     let first = unsafe {
-        GetAdaptersAddresses(AF_UNSPEC as u32, flags, std::ptr::null(), std::ptr::null_mut(), &mut size)
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            flags,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
     };
     // ERROR_BUFFER_OVERFLOW is expected; `size` now holds the required size.
     if first != 0 && size == 0 {
@@ -698,7 +1016,13 @@ fn original_dns_servers(if_index: u32) -> anyhow::Result<Vec<String>> {
     let mut storage = vec![0u64; (size as usize + 7) / 8];
     let adapters = storage.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
     let status = unsafe {
-        GetAdaptersAddresses(AF_UNSPEC as u32, flags, std::ptr::null(), adapters, &mut size)
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            flags,
+            std::ptr::null(),
+            adapters,
+            &mut size,
+        )
     };
     if status != 0 {
         return Err(anyhow!("GetAdaptersAddresses failed: {status}"));
@@ -735,18 +1059,16 @@ unsafe fn socket_address_ip(
     match sa.sa_family {
         AF_INET => {
             let v4 = unsafe { &*(address.lpSockaddr as *const SOCKADDR_IN) };
-            Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
-                unsafe { v4.sin_addr.S_un.S_addr },
-            ))))
+            Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(unsafe {
+                v4.sin_addr.S_un.S_addr
+            }))))
         }
         AF_INET6 => {
             let v6 = unsafe {
                 &*(address.lpSockaddr
                     as *const windows_sys::Win32::Networking::WinSock::SOCKADDR_IN6)
             };
-            Some(IpAddr::V6(Ipv6Addr::from(unsafe {
-                v6.sin6_addr.u.Byte
-            })))
+            Some(IpAddr::V6(Ipv6Addr::from(unsafe { v6.sin6_addr.u.Byte })))
         }
         _ => None,
     }
@@ -762,4 +1084,3 @@ pub fn flush_dns_cache() {
         DnsFlushResolverCache();
     }
 }
-

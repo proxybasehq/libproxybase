@@ -7,7 +7,59 @@ use crate::tunnel::config::TunnelConfig;
 use crate::tunnel::journal::RollbackJournal;
 use crate::tunnel::socket_bypass::PhysicalInterfaceInfo;
 use async_trait::async_trait;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// A normalized IPv4/IPv6 route, before it is handed to a platform API.
+///
+/// Windows is strict where macOS/Linux are forgiving: `CreateIpForwardEntry2`
+/// rejects destination prefixes with non-zero host bits (e.g. `10.255.0.2/30`
+/// instead of `10.255.0.0/30`) and next hops from the wrong address family
+/// with `ERROR_INVALID_PARAMETER` (87). Normalizing every route in one place
+/// keeps all callers honest and makes the rules testable off-Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the Windows manager and platform tests
+pub(crate) struct RouteSpec {
+    pub destination: IpAddr,
+    pub prefix_len: u8,
+    pub next_hop: IpAddr,
+    pub metric: u32,
+}
+
+impl RouteSpec {
+    pub(crate) fn new(
+        destination: IpAddr,
+        prefix_len: u8,
+        next_hop: Option<IpAddr>,
+        metric: u32,
+    ) -> anyhow::Result<Self> {
+        let net = ipnet::IpNet::new(destination, prefix_len)
+            .map_err(|e| anyhow::anyhow!("invalid route {destination}/{prefix_len}: {e}"))?;
+        // Canonical network address: Windows rejects host bits outside the
+        // prefix with ERROR_INVALID_PARAMETER.
+        let destination = net.trunc().addr();
+        let next_hop = next_hop.unwrap_or_else(|| unspecified_like(destination));
+        if destination.is_ipv4() != next_hop.is_ipv4() {
+            anyhow::bail!(
+                "route {destination}/{prefix_len} cannot use an IPv{} next hop ({next_hop})",
+                if destination.is_ipv4() { 4 } else { 6 }
+            );
+        }
+        Ok(Self {
+            destination,
+            prefix_len,
+            next_hop,
+            metric,
+        })
+    }
+}
+
+#[allow(dead_code)] // only used on Windows and in platform tests
+pub(crate) fn unspecified_like(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -232,4 +284,53 @@ pub(crate) async fn run_command_tolerant(program: &str, args: &[&str]) {
 pub(crate) fn parse_ip_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     let rest = line.split_once(marker)?.1.trim();
     Some(rest.split_whitespace().next()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v4(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn v6(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn route_spec_truncates_host_bits() {
+        // This exact route (the TUN address with a /30 prefix) used to be sent
+        // to CreateIpForwardEntry2 verbatim and was rejected with error 87.
+        let spec = RouteSpec::new(v4("10.255.0.2"), 30, None, 1).unwrap();
+        assert_eq!(spec.destination, v4("10.255.0.0"));
+        assert_eq!(spec.next_hop, v4("0.0.0.0"));
+        assert_eq!(spec.prefix_len, 30);
+
+        let spec = RouteSpec::new(v4("128.0.0.1"), 1, None, 1).unwrap();
+        assert_eq!(spec.destination, v4("128.0.0.0"));
+    }
+
+    #[test]
+    fn route_spec_allows_default_next_hop_for_both_families() {
+        let spec4 = RouteSpec::new(v4("0.0.0.0"), 1, None, 1).unwrap();
+        assert_eq!(spec4.next_hop, v4("0.0.0.0"));
+
+        let spec6 = RouteSpec::new(v6("fd00:255::"), 64, None, 1).unwrap();
+        assert_eq!(spec6.next_hop, v6("::"));
+    }
+
+    #[test]
+    fn route_spec_rejects_family_mismatch() {
+        // An IPv6 relay host must never be pinned through an IPv4 gateway:
+        // CreateIpForwardEntry2 rejects that row with error 87.
+        assert!(RouteSpec::new(v6("2001:db8::1"), 128, Some(v4("192.168.1.1")), 1).is_err());
+        assert!(RouteSpec::new(v4("203.0.113.7"), 32, Some(v6("fe80::1")), 1).is_err());
+    }
+
+    #[test]
+    fn route_spec_rejects_invalid_prefix_length() {
+        assert!(RouteSpec::new(v4("10.0.0.0"), 33, None, 1).is_err());
+        assert!(RouteSpec::new(v6("fd00::"), 129, None, 1).is_err());
+    }
 }
