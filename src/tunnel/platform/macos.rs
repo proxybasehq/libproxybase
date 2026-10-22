@@ -5,7 +5,10 @@
 //! `networksetup -setdnsservers` targets one service and is silently reverted
 //! by DHCP renewals on Ethernet/Thunderbolt/USB-tethering interfaces.
 
-use super::{flush_dns_cache, parse_ip_after, run_command, run_command_tolerant};
+use super::{
+    default_route_detail, flush_dns_cache, looks_like_vpn_interface, parse_ip_after, run_command,
+    run_command_tolerant, VpnConflict,
+};
 use crate::tunnel::config::TunnelConfig;
 use crate::tunnel::journal::RollbackJournal;
 use crate::tunnel::socket_bypass::PhysicalInterfaceInfo;
@@ -37,7 +40,60 @@ impl super::PlatformRouteManager for MacOsRouteManager {
         if let Some(info) = detect_default(true).await? {
             return Ok(info);
         }
-        Err(anyhow!("no IPv4 or IPv6 default route found"))
+        Err(anyhow!(
+            "no usable physical default route found (offline, or another VPN owns the default route)"
+        ))
+    }
+
+    async fn detect_conflicting_vpn(&self) -> anyhow::Result<Option<VpnConflict>> {
+        // WireGuard, Tailscale, OpenVPN and most macOS VPN clients create
+        // utunN interfaces; IPsec/PPP clients use ipsecN/pppN.
+        let Ok(interfaces) = run_command("/sbin/ifconfig", &["-l"]).await else {
+            return Ok(None);
+        };
+        let mut active = Vec::new();
+        for name in interfaces.split_whitespace() {
+            if !looks_like_vpn_interface(name) {
+                continue;
+            }
+            if let Ok(details) = run_command("/sbin/ifconfig", &[name]).await {
+                if ifconfig_reports_up(&details) {
+                    active.push(name.to_string());
+                }
+            }
+        }
+        if active.is_empty() {
+            return Ok(None);
+        }
+
+        // IPv4 only on purpose. Modern macOS installs IPv6 default routes on
+        // its built-in utun0-utun3 system interfaces (Continuity/Private
+        // Relay), which are not user VPNs. Every full-tunnel VPN that would
+        // actually fight ProxyBase takes the IPv4 default or its two /1
+        // halves; a split-tunnel VPN leaves those alone.
+        if let Ok(routes) = run_command("/usr/sbin/netstat", &["-rn", "-f", "inet"]).await {
+            if let Some(conflict) = parse_netstat_default_routes(&routes, &active) {
+                return Ok(Some(conflict));
+            }
+        }
+
+        // Belt and braces: some clients install a default route that netstat
+        // renders differently (e.g. `gateway: index: 22 utun4`).
+        if let Ok(out) = run_command("/sbin/route", &["-n", "get", "default"]).await {
+            let owner = out.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("interface:")
+                    .map(str::trim)
+                    .filter(|iface| active.iter().any(|active| active == iface))
+            });
+            if let Some(interface) = owner {
+                return Ok(Some(VpnConflict {
+                    interface: interface.to_string(),
+                    detail: "owns the default route".into(),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     async fn apply_routes(
@@ -87,7 +143,13 @@ impl super::PlatformRouteManager for MacOsRouteManager {
         for net in cfg.bypass_nets().map_err(anyhow::Error::msg)? {
             // Loopback stays on lo0. Re-pointing 127/8 at the physical NIC
             // would break localhost services (and 127.0.0.2+ entirely).
-            if net.addr().is_loopback() || net.addr().is_multicast() {
+            // Broadcast/multicast routes are rejected by `route` anyway
+            // ("bad address: 255.255.255.255/32"), so skip them.
+            let skip = match net.addr() {
+                IpAddr::V4(v4) => v4.is_loopback() || v4.is_broadcast() || v4.is_multicast(),
+                IpAddr::V6(v6) => v6.is_loopback() || v6.is_multicast(),
+            };
+            if skip {
                 continue;
             }
             // Bypass routes are best-effort: the kernel usually already has
@@ -395,4 +457,101 @@ fn if_nametoindex(name: &str) -> anyhow::Result<u32> {
         );
     }
     Ok(index)
+}
+
+/// True when `ifconfig <name>` reports the interface as administratively up.
+fn ifconfig_reports_up(output: &str) -> bool {
+    output
+        .lines()
+        .find(|line| line.contains("flags="))
+        .and_then(|line| line.split_once('<'))
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(flags, _)| flags.split(',').any(|flag| flag.trim() == "UP"))
+        .unwrap_or(false)
+}
+
+/// Find a default/split-default route owned by one of `vpn_interfaces` in
+/// `netstat -rn` output.
+fn parse_netstat_default_routes(output: &str, vpn_interfaces: &[String]) -> Option<VpnConflict> {
+    for line in output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some((destination, rest)) = tokens.split_first() else {
+            continue;
+        };
+        let Some(detail) = default_route_detail(destination) else {
+            continue;
+        };
+        // The Netif column is an exact interface name; IPv6 gateways are
+        // scoped as `fe80::1%utun4`.
+        if let Some(interface) = rest
+            .iter()
+            .map(|token| token.rsplit_once('%').map_or(*token, |(_, iface)| iface))
+            .find(|candidate| vpn_interfaces.iter().any(|iface| iface == candidate))
+        {
+            return Some(VpnConflict {
+                interface: interface.to_string(),
+                detail: detail.to_string(),
+            });
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ifconfig_flags_detect_up_interfaces() {
+        assert!(ifconfig_reports_up(
+            "utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1420"
+        ));
+        assert!(ifconfig_reports_up(
+            "utun4: flags=8051<POINTOPOINT,UP,RUNNING> mtu 1420"
+        ));
+        assert!(!ifconfig_reports_up(
+            "utun4: flags=8050<POINTOPOINT,RUNNING,MULTICAST> mtu 1420"
+        ));
+    }
+
+    #[test]
+    fn detects_wireguard_split_default_routes() {
+        // wg-quick replaces the default route with the two /1 halves.
+        let netstat = "\
+Destination        Gateway            Flags        Netif Expire
+default            192.168.1.1        UGScg          en0
+127                127.0.0.1          UCS            lo0
+0/1                link#26            UCSg          utun4
+128.0/1            link#26            UCSg          utun4
+224.0.0/4          link#4             UmCS           en0
+";
+        let interfaces = vec!["utun4".to_string()];
+        let conflict = parse_netstat_default_routes(netstat, &interfaces).unwrap();
+        assert_eq!(conflict.interface, "utun4");
+        assert!(conflict.detail.contains("0/1"));
+    }
+
+    #[test]
+    fn detects_default_with_scoped_gateway() {
+        let netstat = "\
+Destination                             Gateway                         Flags         Netif Expire
+default                                 fe80::1%utun5                   UGcg          utun5
+";
+        let interfaces = vec!["utun5".to_string()];
+        let conflict = parse_netstat_default_routes(netstat, &interfaces).unwrap();
+        assert_eq!(conflict.interface, "utun5");
+        assert!(conflict.detail.contains("default"));
+    }
+
+    #[test]
+    fn split_tunnel_vpn_is_not_a_conflict() {
+        let netstat = "\
+Destination        Gateway            Flags        Netif Expire
+default            192.168.1.1        UGScg          en0
+100.64.0.0/10      link#25            UCS            utun3
+192.168.0.0/16     link#4             UCS            en0
+";
+        let interfaces = vec!["utun3".to_string()];
+        assert!(parse_netstat_default_routes(netstat, &interfaces).is_none());
+    }
 }

@@ -5,7 +5,10 @@
 //! Fedora, Arch and Debian) and otherwise atomically rewrites
 //! `/etc/resolv.conf` after backing it up.
 
-use super::{flush_dns_cache, run_command, run_command_tolerant};
+use super::{
+    default_route_detail, flush_dns_cache, looks_like_vpn_interface, run_command,
+    run_command_tolerant, VpnConflict,
+};
 use crate::tunnel::config::TunnelConfig;
 use crate::tunnel::journal::RollbackJournal;
 use crate::tunnel::socket_bypass::PhysicalInterfaceInfo;
@@ -36,7 +39,39 @@ impl super::PlatformRouteManager for LinuxRouteManager {
         if let Some(info) = detect_default(&["-6", "route", "show", "default"], true).await? {
             return Ok(info);
         }
-        Err(anyhow!("no default route found via iproute2"))
+        Err(anyhow!(
+            "no usable physical default route found (offline, or another VPN owns the default route)"
+        ))
+    }
+
+    async fn detect_conflicting_vpn(&self) -> anyhow::Result<Option<VpnConflict>> {
+        let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+            return Ok(None);
+        };
+        let mut active = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "proxybase0" || !looks_like_vpn_interface(&name) {
+                continue;
+            }
+            if linux_interface_is_up(&name) {
+                active.push(name);
+            }
+        }
+        if active.is_empty() {
+            return Ok(None);
+        }
+
+        // IPv4 only: that is the family ProxyBase itself needs, and it avoids
+        // flagging IPv6-only system tunnels. Full-tunnel VPNs own `default`
+        // or the two /1 halves; split-tunnel VPNs (Tailscale without an exit
+        // node, corporate routes) do not.
+        if let Ok(routes) = run_command("ip", &["-4", "route", "show", "table", "main"]).await {
+            if let Some(conflict) = parse_ip_default_routes(&routes, &active) {
+                return Ok(Some(conflict));
+            }
+        }
+        Ok(None)
     }
 
     async fn apply_routes(
@@ -93,8 +128,13 @@ impl super::PlatformRouteManager for LinuxRouteManager {
 
         // 2. Bypass routes pinned to the physical interface.
         for net in cfg.bypass_nets().map_err(anyhow::Error::msg)? {
-            // Never create a physical route for loopback or multicast.
-            if net.addr().is_loopback() || net.addr().is_multicast() {
+            // Never create a physical route for loopback, broadcast or
+            // multicast.
+            let skip = match net.addr() {
+                IpAddr::V4(v4) => v4.is_loopback() || v4.is_broadcast() || v4.is_multicast(),
+                IpAddr::V6(v6) => v6.is_loopback() || v6.is_multicast(),
+            };
+            if skip {
                 continue;
             }
             add_net(&net.to_string(), &phys.name).await;
@@ -482,4 +522,78 @@ fn if_nametoindex(name: &str) -> Option<u32> {
     let c = std::ffi::CString::new(name).ok()?;
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     (idx != 0).then_some(idx)
+}
+
+/// IFF_UP is bit 0 of `/sys/class/net/<if>/flags`. `operstate` is not used
+/// because tun devices often report "unknown" even while passing traffic.
+fn linux_interface_is_up(name: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/flags"))
+        .ok()
+        .and_then(|flags| u32::from_str_radix(flags.trim(), 16).ok())
+        .map(|flags| flags & 0x1 != 0)
+        .unwrap_or(false)
+}
+
+fn parse_ip_default_routes(output: &str, vpn_interfaces: &[String]) -> Option<VpnConflict> {
+    for line in output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some((destination, rest)) = tokens.split_first() else {
+            continue;
+        };
+        let Some(detail) = default_route_detail(destination) else {
+            continue;
+        };
+        let dev = rest
+            .iter()
+            .position(|token| *token == "dev")
+            .and_then(|index| rest.get(index + 1))
+            .copied();
+        if let Some(dev) = dev {
+            if vpn_interfaces.iter().any(|iface| iface == dev) {
+                return Some(VpnConflict {
+                    interface: dev.to_string(),
+                    detail: detail.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_wireguard_split_default_routes() {
+        let routes = "\
+default via 192.168.1.1 dev enp0s3 proto dhcp metric 100
+0.0.0.0/1 dev wg0 scope link
+128.0.0.0/1 dev wg0 scope link
+192.168.1.0/24 dev enp0s3 scope link
+";
+        let vpn = vec!["wg0".to_string()];
+        let conflict = parse_ip_default_routes(routes, &vpn).unwrap();
+        assert_eq!(conflict.interface, "wg0");
+        assert!(conflict.detail.contains("0.0.0.0/1"));
+    }
+
+    #[test]
+    fn detects_full_tunnel_default() {
+        let routes = "default dev tun0 scope link\n10.8.0.0/24 dev tun0 scope link\n";
+        let vpn = vec!["tun0".to_string()];
+        let conflict = parse_ip_default_routes(routes, &vpn).unwrap();
+        assert_eq!(conflict.interface, "tun0");
+        assert!(conflict.detail.contains("default"));
+    }
+
+    #[test]
+    fn split_tunnel_vpn_is_not_a_conflict() {
+        let routes = "\
+default via 192.168.1.1 dev enp0s3 proto dhcp metric 100
+100.64.0.0/10 dev tailscale0 scope link
+";
+        let vpn = vec!["tailscale0".to_string()];
+        assert!(parse_ip_default_routes(routes, &vpn).is_none());
+    }
 }

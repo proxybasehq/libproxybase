@@ -61,6 +61,53 @@ pub(crate) fn unspecified_like(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// A concurrently active full-tunnel VPN that would fight the ProxyBase
+/// tunnel for the system default route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpnConflict {
+    pub interface: String,
+    /// Which route shape the other VPN owns (default, split-default half, ...).
+    pub detail: String,
+}
+
+/// Classify a routing-table destination that only a full-tunnel VPN installs.
+///
+/// Split-tunnel VPNs (Tailscale without an exit node, corporate routes) leave
+/// the default route alone and are safe to run alongside ProxyBase; full
+/// tunnels either take `default` or the two longest-prefix halves.
+pub(crate) fn default_route_detail(destination: &str) -> Option<&'static str> {
+    match destination.trim() {
+        "default" | "0.0.0.0/0" | "0/0" | "::/0" => Some("owns the default route"),
+        "0.0.0.0/1" | "0/1" => Some("owns 0.0.0.0/1"),
+        "128.0.0.0/1" | "128.0/1" => Some("owns 128.0.0.0/1"),
+        "::/1" | "0::/1" => Some("owns ::/1"),
+        "8000::/1" => Some("owns 8000::/1"),
+        _ => None,
+    }
+}
+
+/// Name heuristics for tunnel interfaces on macOS and Linux.
+///
+/// `utun` covers WireGuard, Tailscale, OpenVPN, and most macOS VPN clients;
+/// `wg`/`nordlynx`/`tailscale0` cover Linux WireGuard deployments.
+pub(crate) fn looks_like_vpn_interface(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const PREFIXES: &[&str] = &[
+        "utun",
+        "ipsec",
+        "ppp",
+        "tun",
+        "tap",
+        "wg",
+        "nordlynx",
+        "tailscale",
+        "proton",
+        "mullvad",
+        "vpn",
+    ];
+    PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+}
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -121,6 +168,17 @@ pub trait PlatformRouteManager: Send + Sync {
         _relay: std::net::IpAddr,
         _phys: &PhysicalInterfaceInfo,
     ) {
+    }
+
+    /// Best-effort detection of another active VPN that owns the default
+    /// route. A full-tunnel VPN makes ProxyBase's route setup impossible (or
+    /// silently routes it into the other tunnel), so callers should surface
+    /// the returned conflict as an actionable error.
+    ///
+    /// Implementations must ignore split-tunnel VPNs that only own specific
+    /// prefixes, and must never report ProxyBase's own TUN device.
+    async fn detect_conflicting_vpn(&self) -> anyhow::Result<Option<VpnConflict>> {
+        Ok(None)
     }
 
     fn platform_name(&self) -> &'static str;
@@ -332,5 +390,44 @@ mod tests {
     fn route_spec_rejects_invalid_prefix_length() {
         assert!(RouteSpec::new(v4("10.0.0.0"), 33, None, 1).is_err());
         assert!(RouteSpec::new(v6("fd00::"), 129, None, 1).is_err());
+    }
+
+    #[test]
+    fn default_route_shapes_identify_full_tunnel_vpns() {
+        assert!(default_route_detail("default").is_some());
+        assert!(default_route_detail("0.0.0.0/0").is_some());
+        assert!(default_route_detail("0/1").is_some());
+        assert!(default_route_detail("128.0/1").is_some());
+        assert!(default_route_detail("::/1").is_some());
+        assert!(default_route_detail("8000::/1").is_some());
+
+        // Split-tunnel routes must not be treated as conflicts.
+        assert!(default_route_detail("100.64.0.0/10").is_none());
+        assert!(default_route_detail("10.0.0.0/8").is_none());
+        assert!(default_route_detail("fd00::/8").is_none());
+        assert!(default_route_detail("224.0.0.0/4").is_none());
+    }
+
+    #[test]
+    fn vpn_interface_name_heuristics() {
+        for name in [
+            "utun4",
+            "ipsec0",
+            "ppp0",
+            "tun0",
+            "tap0",
+            "wg0",
+            "tailscale0",
+            "nordlynx",
+            "proton0",
+        ] {
+            assert!(looks_like_vpn_interface(name), "{name} should look like a VPN");
+        }
+        for name in ["en0", "lo0", "bridge0", "awdl0", "eth0", "wlan0", "proxybase0"] {
+            assert!(
+                !looks_like_vpn_interface(name),
+                "{name} should not look like a VPN"
+            );
+        }
     }
 }

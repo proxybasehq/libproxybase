@@ -371,6 +371,31 @@ impl SystemTunnelEngine {
         .await;
 
         let manager: Arc<dyn PlatformRouteManager> = Arc::from(platform::current());
+
+        // Preflight: refuse to fight another full-tunnel VPN for the default
+        // route. Split-tunnel VPNs (specific prefixes only) are not reported
+        // and can coexist.
+        match manager.detect_conflicting_vpn().await {
+            Ok(Some(conflict)) => {
+                let message = format!(
+                    "Another VPN is active ({}: {}). Disconnect it and try again — \
+                     ProxyBase cannot share the system default route with another \
+                     full-tunnel VPN.",
+                    conflict.interface, conflict.detail
+                );
+                tracing::warn!(
+                    interface = %conflict.interface,
+                    detail = %conflict.detail,
+                    "refusing to start the tunnel while another VPN owns the default route"
+                );
+                self.publish_error(TunnelErrorCode::ConflictingVpn, message.clone())
+                    .await;
+                return Err(TunnelError::new(TunnelErrorCode::ConflictingVpn, message));
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(error = %e, "VPN conflict preflight failed; continuing"),
+        }
+
         let phys = match manager.detect_physical_route().await {
             Ok(p) => p,
             Err(e) => {

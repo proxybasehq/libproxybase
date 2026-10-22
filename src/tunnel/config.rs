@@ -79,6 +79,8 @@ pub enum TunnelMode {
 pub enum TunnelErrorCode {
     PrivilegeElevationDenied,
     VpnPermissionDeniedOnAndroid,
+    /// Another full-tunnel VPN owns the system default route.
+    ConflictingVpn,
     TunDeviceCreationFailed,
     RoutingConfigurationFailed,
     DnsConfigurationFailed,
@@ -94,6 +96,7 @@ impl TunnelErrorCode {
         match self {
             TunnelErrorCode::PrivilegeElevationDenied => "privilege_elevation_denied",
             TunnelErrorCode::VpnPermissionDeniedOnAndroid => "vpn_permission_denied_on_android",
+            TunnelErrorCode::ConflictingVpn => "conflicting_vpn",
             TunnelErrorCode::TunDeviceCreationFailed => "tun_device_creation_failed",
             TunnelErrorCode::RoutingConfigurationFailed => "routing_configuration_failed",
             TunnelErrorCode::DnsConfigurationFailed => "dns_configuration_failed",

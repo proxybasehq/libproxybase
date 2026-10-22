@@ -8,7 +8,7 @@
 //! on every physical interface; the kernel removes those filters automatically
 //! if this process exits or crashes.
 
-use super::{unspecified_like, PlatformRouteManager, RouteSpec};
+use super::{default_route_detail, unspecified_like, PlatformRouteManager, RouteSpec, VpnConflict};
 use crate::tunnel::config::TunnelConfig;
 use crate::tunnel::journal::RollbackJournal;
 use crate::tunnel::socket_bypass::PhysicalInterfaceInfo;
@@ -27,10 +27,11 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetBestRoute2, GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry,
     InitializeIpInterfaceEntry, SetInterfaceDnsSettings, SetIpForwardEntry2,
     DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER,
-    GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
-    IP_ADAPTER_ADDRESSES_LH, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, IF_TYPE_PPP,
+    IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    MIB_IPINTERFACE_ROW,
 };
-use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+use windows_sys::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmSubLayerAdd0, FWPM_ACTION0,
     FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_PORT,
@@ -90,6 +91,15 @@ impl PlatformRouteManager for WindowsRouteManager {
         // route lookup; never mistake our own TUN for the physical uplink.
         let own_tun = self.tun_luid.lock().ok().and_then(|guard| *guard);
         detect_default_route(own_tun)
+    }
+
+    async fn detect_conflicting_vpn(&self) -> anyhow::Result<Option<VpnConflict>> {
+        let adapters = enumerate_vpn_adapters();
+        if adapters.is_empty() {
+            return Ok(None);
+        }
+        let own_tun = self.tun_luid.lock().ok().and_then(|guard| *guard);
+        Ok(conflicting_vpn_from_routes(&adapters, own_tun))
     }
 
     async fn apply_routes(
@@ -598,6 +608,140 @@ fn detect_default_route(own_tun: Option<u64>) -> anyhow::Result<PhysicalInterfac
         index,
         gateway_ip: IpAddr::V4(gateway),
     })
+}
+
+struct VpnAdapter {
+    luid: u64,
+    name: String,
+}
+
+/// Enumerate up, non-ProxyBase adapters that look like a VPN client.
+///
+/// WireGuard/Tailscale use Wintun (IF_TYPE_TUNNEL, matching "wintun"),
+/// OpenVPN uses a TAP-Windows Ethernet adapter, and IKEv2/PPP VPNs use
+/// IF_TYPE_PPP. The route-table scan in [`conflicting_vpn_from_routes`] is
+/// what decides whether they actually own a default route.
+fn enumerate_vpn_adapters() -> Vec<VpnAdapter> {
+    let flags = GAA_FLAG_INCLUDE_ALL_INTERFACES | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+    let mut size: u32 = 0;
+    let first = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            flags,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if first != 0 && size == 0 {
+        return Vec::new();
+    }
+    let mut storage = vec![0u64; (size as usize + 7) / 8];
+    let adapters = storage.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+    let status = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            flags,
+            std::ptr::null(),
+            adapters,
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut current = adapters;
+    while !current.is_null() {
+        let adapter = unsafe { &*current };
+        let name = pwstr_to_string(adapter.FriendlyName);
+        let description = pwstr_to_string(adapter.Description);
+        let own = is_own_tun_name(&name) || is_own_tun_name(&description);
+        let up = adapter.OperStatus == IfOperStatusUp;
+        let tunnel_type = adapter.IfType == IF_TYPE_TUNNEL || adapter.IfType == IF_TYPE_PPP;
+        if up && !own && (tunnel_type || vpn_name_matches(&name) || vpn_name_matches(&description))
+        {
+            out.push(VpnAdapter {
+                luid: luid_value(&adapter.Luid),
+                name: if name.is_empty() { description } else { name },
+            });
+        }
+        current = adapter.Next;
+    }
+    out
+}
+
+fn conflicting_vpn_from_routes(
+    adapters: &[VpnAdapter],
+    own_tun: Option<u64>,
+) -> Option<VpnConflict> {
+    // IPv4 only: that is the family ProxyBase itself needs, and it avoids
+    // flagging IPv6-only system tunnels (Teredo/ISATAP are IF_TYPE_TUNNEL).
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIpForwardTable2(AF_INET, &mut table) } != 0 || table.is_null() {
+        return None;
+    }
+    let rows = unsafe {
+        std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+    };
+    let mut found = None;
+    for row in rows {
+        let luid = luid_value(&row.InterfaceLuid);
+        if Some(luid) == own_tun {
+            continue;
+        }
+        let Some(adapter) = adapters.iter().find(|adapter| adapter.luid == luid) else {
+            continue;
+        };
+        let Some(prefix) = (unsafe { sockaddr_ip(&row.DestinationPrefix.Prefix) }) else {
+            continue;
+        };
+        // Full-tunnel VPNs take `default` or the two longest-prefix /1
+        // halves; split-tunnel routes use longer prefixes.
+        let destination = match row.DestinationPrefix.PrefixLength {
+            0 => "default".to_string(),
+            1 => format!("{prefix}/1"),
+            _ => continue,
+        };
+        if let Some(detail) = default_route_detail(&destination) {
+            found = Some(VpnConflict {
+                interface: adapter.name.clone(),
+                detail: detail.to_string(),
+            });
+            break;
+        }
+    }
+    unsafe { FreeMibTable(table as *const _) };
+    found
+}
+
+fn pwstr_to_string(ptr: windows_sys::core::PWSTR) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+fn vpn_name_matches(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "wireguard",
+        "wintun",
+        "tap-windows",
+        "openvpn",
+        "tailscale",
+        "nordlynx",
+        "proton",
+        "mullvad",
+        "cloudflare warp",
+        "vpn",
+    ];
+    KEYWORDS.iter().any(|keyword| lower.contains(keyword))
 }
 
 /// Ask Windows which route it would use for `destination`.
