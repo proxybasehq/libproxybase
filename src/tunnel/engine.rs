@@ -1430,9 +1430,24 @@ fn create_desktop_device(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDev
         let mut b = tun_rs::DeviceBuilder::new().name("ProxyBase");
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                let wintun_path = dir.join("wintun.dll");
-                if wintun_path.exists() {
-                    b = b.wintun_file(wintun_path.to_string_lossy().to_string());
+                let arch = if cfg!(target_arch = "aarch64") {
+                    "arm64"
+                } else {
+                    "amd64"
+                };
+                let candidates = [
+                    dir.join("wintun.dll"),
+                    dir.join("..").join("wintun.dll"),
+                    dir.join("resources").join("wintun").join(arch).join("wintun.dll"),
+                    dir.join("resources").join("resources").join("wintun").join(arch).join("wintun.dll"),
+                    dir.join("..").join("resources").join("wintun").join(arch).join("wintun.dll"),
+                    dir.join("..").join("resources").join("resources").join("wintun").join(arch).join("wintun.dll"),
+                ];
+                for path in &candidates {
+                    if path.exists() {
+                        b = b.wintun_file(path.to_string_lossy().to_string());
+                        break;
+                    }
                 }
             }
         }
