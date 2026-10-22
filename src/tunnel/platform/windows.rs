@@ -141,7 +141,7 @@ impl PlatformRouteManager for WindowsRouteManager {
         let tun_cidr: ipnet::IpNet = format!("{}/{}", cfg.tun_ipv4, cfg.tun_prefix).parse()?;
         add_or_replace_route(
             &tun_luid,
-            tun_cidr.addr(),
+            tun_cidr.trunc().addr(),
             tun_cidr.prefix_len(),
             None,
             1,
@@ -532,15 +532,26 @@ fn add_or_replace_route(
     next_hop: Option<IpAddr>,
     metric: u32,
 ) -> anyhow::Result<()> {
+    // Windows rejects routes with non-zero host bits outside prefix_len
+    // with ERROR_INVALID_PARAMETER (87). Truncate to network address.
+    let clean_dest = ipnet::IpNet::new(destination, prefix_len)
+        .map(|net| net.trunc().addr())
+        .unwrap_or(destination);
+
     let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
     unsafe { InitializeIpForwardEntry(&mut row) };
     row.InterfaceLuid = *luid;
     row.DestinationPrefix.PrefixLength = prefix_len;
-    row.DestinationPrefix.Prefix = make_sockaddr(destination);
-    row.NextHop = make_sockaddr(next_hop.unwrap_or_else(|| unspecified_like(destination)));
+    row.DestinationPrefix.Prefix = make_sockaddr(clean_dest);
+    row.NextHop = make_sockaddr(next_hop.unwrap_or_else(|| unspecified_like(clean_dest)));
+    // InitializeIpForwardEntry sets SitePrefixLength to 255 (illegal).
+    // If SitePrefixLength > DestinationPrefix.PrefixLength, CreateIpForwardEntry2
+    // fails with ERROR_INVALID_PARAMETER (87). It must be explicitly set to 0.
+    row.SitePrefixLength = 0;
     row.Metric = metric;
     row.Protocol = MIB_IPPROTO_NETMGMT;
     row.Immortal = true;
+    row.Loopback = false;
 
     let status = unsafe { CreateIpForwardEntry2(&row) };
     if status == ERROR_OBJECT_ALREADY_EXISTS {
@@ -557,11 +568,47 @@ fn add_or_replace_route(
 }
 
 fn delete_route(luid: &NET_LUID_LH, destination: IpAddr, prefix_len: u8) -> WIN32_ERROR {
+    let clean_dest = ipnet::IpNet::new(destination, prefix_len)
+        .map(|net| net.trunc().addr())
+        .unwrap_or(destination);
+    let family = match destination {
+        IpAddr::V4(_) => AF_INET,
+        IpAddr::V6(_) => AF_INET6,
+    };
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let status = unsafe { GetIpForwardTable2(family, &mut table) };
+    if status == 0 && !table.is_null() {
+        let rows = unsafe {
+            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+        };
+        let mut last_error = 0;
+        let mut deleted = false;
+        for row in rows {
+            if unsafe { row.InterfaceLuid.Value == luid.Value }
+                && row.DestinationPrefix.PrefixLength == prefix_len
+                && unsafe { sockaddr_ip(&row.DestinationPrefix.Prefix) } == Some(clean_dest)
+            {
+                let err = unsafe { DeleteIpForwardEntry2(row) };
+                if err != 0 {
+                    last_error = err;
+                } else {
+                    deleted = true;
+                }
+            }
+        }
+        unsafe { FreeMibTable(table as *const _) };
+        if deleted || last_error == 0 {
+            return 0;
+        }
+    }
+
     let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
     unsafe { InitializeIpForwardEntry(&mut row) };
     row.InterfaceLuid = *luid;
     row.DestinationPrefix.PrefixLength = prefix_len;
-    row.DestinationPrefix.Prefix = make_sockaddr(destination);
+    row.DestinationPrefix.Prefix = make_sockaddr(clean_dest);
+    row.NextHop = make_sockaddr(unspecified_like(clean_dest));
+    row.SitePrefixLength = 0;
     unsafe { DeleteIpForwardEntry2(&row) }
 }
 
