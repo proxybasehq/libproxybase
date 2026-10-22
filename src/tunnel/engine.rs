@@ -1426,7 +1426,19 @@ fn create_desktop_device(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDev
     #[cfg(target_os = "linux")]
     let builder = tun_rs::DeviceBuilder::new().name("proxybase0");
     #[cfg(target_os = "windows")]
-    let builder = tun_rs::DeviceBuilder::new().name("ProxyBase");
+    let builder = {
+        let mut b = tun_rs::DeviceBuilder::new();
+        b.name("ProxyBase");
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let wintun_path = dir.join("wintun.dll");
+                if wintun_path.exists() {
+                    b.wintun_file(wintun_path.to_string_lossy().to_string());
+                }
+            }
+        }
+        b
+    };
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let builder = tun_rs::DeviceBuilder::new();
 

@@ -20,12 +20,13 @@ use windows_sys::Win32::Foundation::{
     ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, HANDLE, WIN32_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToNameW,
+    ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToNameW,
     ConvertInterfaceNameToLuidW, CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable,
-    GetAdaptersAddresses, GetIpForwardTable2, InitializeIpForwardEntry, SetInterfaceDnsSettings,
-    SetIpForwardEntry2, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
-    DNS_SETTING_NAMESERVER, GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_SKIP_ANYCAST,
-    GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    GetAdaptersAddresses, GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry,
+    InitializeIpInterfaceEntry, SetInterfaceDnsSettings, SetIpForwardEntry2, DNS_INTERFACE_SETTINGS,
+    DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, GAA_FLAG_INCLUDE_ALL_INTERFACES,
+    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, MIB_IPFORWARD_ROW2,
+    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
@@ -124,8 +125,12 @@ impl PlatformRouteManager for WindowsRouteManager {
             if skip {
                 continue;
             }
+            let next_hop = match net.addr() {
+                IpAddr::V4(_) => Some(phys.gateway_ip),
+                IpAddr::V6(_) => None,
+            };
             if let Err(e) =
-                add_or_replace_route(&phys_luid, net.addr(), net.prefix_len(), None, 1)
+                add_or_replace_route(&phys_luid, net.addr(), net.prefix_len(), next_hop, 1)
             {
                 tracing::warn!(cidr = %net, error = %e, "could not install bypass route");
             }
@@ -141,16 +146,24 @@ impl PlatformRouteManager for WindowsRouteManager {
             None,
             1,
         )?;
-        add_or_replace_route(
+        if let Err(e) = add_or_replace_route(
             &tun_luid,
             "fd00:255::".parse().unwrap(),
             64,
             None,
             1,
-        )?;
-        for cidr in ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"] {
+        ) {
+            tracing::warn!(error = %e, "could not install IPv6 ULA route; continuing");
+        }
+        for cidr in ["0.0.0.0/1", "128.0.0.0/1"] {
             let net: ipnet::IpNet = cidr.parse().unwrap();
             add_or_replace_route(&tun_luid, net.addr(), net.prefix_len(), None, 1)?;
+        }
+        for cidr in ["::/1", "8000::/1"] {
+            let net: ipnet::IpNet = cidr.parse().unwrap();
+            if let Err(e) = add_or_replace_route(&tun_luid, net.addr(), net.prefix_len(), None, 1) {
+                tracing::warn!(cidr = %cidr, error = %e, "could not install IPv6 sub-default route; continuing with IPv4 tunnel");
+            }
         }
 
         // 4. Windows DNS leak blocker (dynamic WFP session).
@@ -360,8 +373,9 @@ impl WfpEngine {
         };
         sublayer.weight = 0x8000;
         let status = unsafe { FwpmSubLayerAdd0(self.0, &sublayer, std::ptr::null_mut()) };
-        if status != 0 {
-            return Err(anyhow!("FwpmSubLayerAdd0 failed: {status}"));
+        const FWP_E_ALREADY_EXISTS: u32 = 0x8032000C;
+        if status != 0 && status != FWP_E_ALREADY_EXISTS {
+            return Err(anyhow!("FwpmSubLayerAdd0 failed: {status:#x}"));
         }
         Ok(())
     }
@@ -478,10 +492,23 @@ fn detect_default_route() -> anyhow::Result<PhysicalInterfaceInfo> {
                 _ => None,
             })
             .unwrap_or(Ipv4Addr::UNSPECIFIED);
-        let candidate = (row.Metric, row.InterfaceLuid, next_hop, row.InterfaceIndex);
+        if next_hop == Ipv4Addr::UNSPECIFIED {
+            continue;
+        }
+        let mut if_row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
+        unsafe { InitializeIpInterfaceEntry(&mut if_row) };
+        if_row.Family = AF_INET;
+        if_row.InterfaceLuid = row.InterfaceLuid;
+        let if_metric = if unsafe { GetIpInterfaceEntry(&mut if_row) } == 0 {
+            if_row.Metric
+        } else {
+            0
+        };
+        let effective_metric = row.Metric.saturating_add(if_metric);
+        let candidate = (effective_metric, row.InterfaceLuid, next_hop, row.InterfaceIndex);
         if best
             .as_ref()
-            .map(|(metric, _, _, _)| row.Metric < *metric)
+            .map(|(metric, _, _, _)| effective_metric < *metric)
             .unwrap_or(true)
         {
             best = Some(candidate);
@@ -578,11 +605,20 @@ unsafe fn sockaddr_ip(sa: &SOCKADDR_INET) -> Option<IpAddr> {
 fn luid_from_name(name: &str) -> anyhow::Result<NET_LUID_LH> {
     let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
-    let status = unsafe { ConvertInterfaceNameToLuidW(wide_name.as_ptr(), &mut luid) };
-    if status != 0 {
-        return Err(anyhow!("ConvertInterfaceNameToLuidW({name}) failed: {status}"));
+    // Try resolving as an interface alias first (e.g. "ProxyBase", "Ethernet", "Wi-Fi"),
+    // which is what tun-rs and the Windows UI present.
+    let status_alias = unsafe { ConvertInterfaceAliasToLuid(wide_name.as_ptr(), &mut luid) };
+    if status_alias == 0 {
+        return Ok(luid);
     }
-    Ok(luid)
+    // Fall back to NDIS interface name (e.g. "ethernet_32768", "wintun_0").
+    let status_name = unsafe { ConvertInterfaceNameToLuidW(wide_name.as_ptr(), &mut luid) };
+    if status_name == 0 {
+        return Ok(luid);
+    }
+    Err(anyhow!(
+        "could not resolve interface '{name}' to LUID (alias error: {status_alias}, name error: {status_name})"
+    ))
 }
 
 fn name_from_luid(luid: &NET_LUID_LH) -> anyhow::Result<String> {
